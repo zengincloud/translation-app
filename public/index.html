@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LiveTranslate</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- Lobby -->
+    <div id="lobby">
+      <div class="logo">LiveTranslate</div>
+
+      <div class="field">
+        <label>Your language</label>
+        <select id="my-language">
+          <option value="English">English</option>
+          <option value="Arabic">Arabic</option>
+          <option value="Spanish">Spanish</option>
+          <option value="French">French</option>
+          <option value="German">German</option>
+          <option value="Chinese">Chinese</option>
+          <option value="Japanese">Japanese</option>
+          <option value="Portuguese">Portuguese</option>
+          <option value="Hindi">Hindi</option>
+          <option value="Russian">Russian</option>
+        </select>
+      </div>
+
+      <button id="create-btn" class="btn primary">Create Room</button>
+
+      <div class="divider">or join an existing room</div>
+
+      <div class="join-row">
+        <input id="code-input" type="text" placeholder="ROOM CODE" maxlength="6" autocomplete="off" spellcheck="false">
+        <button id="join-btn" class="btn secondary">Join</button>
+      </div>
+
+      <div id="lobby-error" class="error hidden"></div>
+    </div>
+
+    <!-- Room -->
+    <div id="room" class="hidden">
+      <div class="room-header">
+        <div class="room-code-label">Room <span id="room-code-display"></span></div>
+        <div id="status" class="status waiting">Waiting for someone to join…</div>
+      </div>
+
+      <div class="lang-bar">
+        <div class="lang-pill" id="my-lang-pill"></div>
+        <div class="lang-arrow">⇄</div>
+        <div class="lang-pill muted" id="peer-lang-pill">?</div>
+      </div>
+
+      <div id="transcripts">
+        <div id="transcript-list">
+          <div class="placeholder">Transcripts will appear here</div>
+        </div>
+      </div>
+
+      <div class="talk-area">
+        <button id="talk-btn" class="talk-btn" disabled>
+          <span class="mic">🎤</span>
+          <span class="label">Hold to Talk</span>
+        </button>
+        <div id="rec-indicator" class="rec hidden">● Recording</div>
+        <div id="processing-indicator" class="processing hidden">Translating…</div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
