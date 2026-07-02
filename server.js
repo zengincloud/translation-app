@@ -2,13 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const FormData = require('form-data');
 const fetch = require('node-fetch');
+const WebSocket = require('ws');
 const QRCode = require('qrcode');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { maxHttpBufferSize: 2e6 });
 
 const XAI_KEY = process.env.XAI_API_KEY;
 
@@ -34,6 +34,9 @@ const GRACE_MS = 5 * 60 * 1000; // how long a dropped connection can rejoin befo
 
 // key `${roomCode}:${userId}` -> timeout that finalizes removal once the grace period lapses
 const cleanupTimers = new Map();
+
+// per-socket live-utterance state while its talk button is held: socket.id -> utterance state
+const activeUtterances = new Map();
 
 function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -93,6 +96,16 @@ function removeUserImmediately(roomCode, userId) {
   } else {
     broadcastParticipants(roomCode);
   }
+}
+
+// tears down any in-progress live-transcription/speech session for a socket (disconnect, error, or utterance end)
+function endUtterance(socketId) {
+  const state = activeUtterances.get(socketId);
+  if (!state) return;
+  activeUtterances.delete(socketId);
+  clearTimeout(state.flushTimer);
+  if (state.stt) state.stt.close();
+  state.ttsSessions.forEach(session => session.close());
 }
 
 io.on('connection', (socket) => {
@@ -162,6 +175,7 @@ io.on('connection', (socket) => {
 
   // explicit "Leave" click — remove the slot right away rather than waiting out the grace period
   socket.on('leave-room', () => {
+    endUtterance(socket.id);
     if (!currentRoom || !currentUserId) return;
     removeUserImmediately(currentRoom, currentUserId);
     currentRoom = null;
@@ -169,59 +183,157 @@ io.on('connection', (socket) => {
     userLanguage = null;
   });
 
-  socket.on('audio', async ({ audio }) => {
-    if (!currentRoom) return;
+  // --- Live streaming speech pipeline ---
+  // Fired the instant the talk button is pressed, before any audio exists yet. This opens the
+  // STT WebSocket and the per-target-language TTS WebSockets immediately so their connection
+  // setup happens in parallel with the user taking a breath and starting to talk, instead of
+  // adding that setup time to the critical path once audio is ready.
+  socket.on('speech-start', () => {
+    if (!currentRoom || !currentUserId) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
-    const roomUsers = connectedUsers(room);
-    if (roomUsers.length < 2) return;
 
-    const others = roomUsers.filter(u => u.socketId !== socket.id);
+    const others = connectedUsers(room).filter(u => u.socketId !== socket.id);
     if (others.length === 0) return;
 
-    try {
-      const transcript = await transcribe(audio);
-      if (!transcript) return;
+    endUtterance(socket.id); // safety: clear out any stale prior session for this socket
 
-      // listeners who already speak the same language just get the raw audio, no translation needed
-      const sameLanguage = others.filter(u => u.language === userLanguage);
-      sameLanguage.forEach(u => {
-        io.to(u.socketId).emit('audio-received', {
-          audio,
-          mimeType: 'audio/webm',
-          original: transcript,
-          translated: transcript
-        });
+    const utteranceId = `${socket.id}-${Date.now()}`;
+    const sameLanguageListeners = others.filter(u => u.language === userLanguage).map(u => u.socketId);
+    const targetLanguages = [...new Set(others.map(u => u.language).filter(l => l !== userLanguage))];
+
+    sameLanguageListeners.forEach(id => io.to(id).emit('speech-utterance-start', { utteranceId, sampleRate: 16000 }));
+    targetLanguages.forEach(lang => {
+      others.filter(u => u.language === lang)
+        .forEach(u => io.to(u.socketId).emit('speech-utterance-start', { utteranceId, sampleRate: 24000 }));
+    });
+
+    const listenersByLanguage = new Map(
+      targetLanguages.map(lang => [lang, others.filter(u => u.language === lang).map(u => u.socketId)])
+    );
+
+    const state = {
+      utteranceId,
+      sameLanguageListeners,
+      targetLanguages,
+      listenersByLanguage,
+      ttsSessions: new Map(),   // targetLanguage -> stream handle
+      translatedText: new Map(), // targetLanguage -> accumulated translated text (for the chat history bubble)
+      fullText: '',
+      committedLength: 0,
+      flushTimer: null,
+      stt: null,
+      pendingTranslations: 0,
+      finalizing: false
+    };
+    activeUtterances.set(socket.id, state);
+
+    targetLanguages.forEach(lang => {
+      const listeners = listenersByLanguage.get(lang);
+      const handle = openTtsStream({
+        language: lang,
+        voiceId: pickVoiceId(userLanguage, lang),
+        onAudioDelta: (buf) => {
+          listeners.forEach(id => io.to(id).emit('speech-chunk-out', {
+            utteranceId, audio: buf.toString('base64'), sampleRate: 24000
+          }));
+        },
+        onDone: () => {
+          listeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId }));
+          maybeFinishUtterance(socket.id, utteranceId);
+        },
+        onError: (err) => console.error('TTS stream error:', err.message)
+      });
+      state.ttsSessions.set(lang, handle);
+    });
+
+    function flushPending(isFinal) {
+      const state = activeUtterances.get(socket.id);
+      if (!state || state.utteranceId !== utteranceId) return;
+
+      const pendingText = state.fullText.slice(state.committedLength);
+      clearTimeout(state.flushTimer);
+      state.flushTimer = null;
+
+      if (!pendingText.trim()) {
+        if (isFinal) finalizeTranslations(socket.id, utteranceId);
+        return;
+      }
+      state.committedLength = state.fullText.length;
+
+      targetLanguages.forEach(lang => {
+        state.pendingTranslations++;
+        translate(pendingText, userLanguage, lang)
+          .then(translated => {
+            if (!translated) return;
+            const current = activeUtterances.get(socket.id);
+            if (!current || current.utteranceId !== utteranceId) return;
+            const soFar = current.translatedText.get(lang) || '';
+            current.translatedText.set(lang, soFar ? `${soFar} ${translated}` : translated);
+            const session = current.ttsSessions.get(lang);
+            if (session) session.sendText(translated);
+          })
+          .catch(err => console.error('Translate error:', err.message))
+          .finally(() => {
+            const current = activeUtterances.get(socket.id);
+            if (current && current.utteranceId === utteranceId) {
+              current.pendingTranslations--;
+              if (isFinal) finalizeTranslations(socket.id, utteranceId);
+            }
+          });
       });
 
-      // translate + speak once per unique target language, then fan out to everyone listening in that language
-      const targetLanguages = [...new Set(others.map(u => u.language).filter(l => l !== userLanguage))];
-
-      for (const targetLanguage of targetLanguages) {
-        const translated = await translate(transcript, userLanguage, targetLanguage);
-        if (!translated) continue;
-
-        const ttsAudio = await textToSpeech(translated, targetLanguage, pickVoiceId(userLanguage, targetLanguage));
-        const payload = {
-          audio: ttsAudio.toString('base64'),
-          mimeType: 'audio/mpeg',
-          original: transcript,
-          translated
-        };
-
-        others
-          .filter(u => u.language === targetLanguage)
-          .forEach(u => io.to(u.socketId).emit('audio-received', payload));
-      }
-
-      socket.emit('my-transcript', { text: transcript });
-    } catch (err) {
-      console.error('Pipeline error:', err.message);
-      socket.emit('pipeline-error', { message: 'Translation failed, please try again' });
+      if (isFinal && targetLanguages.length === 0) finalizeTranslations(socket.id, utteranceId);
     }
+
+    state.stt = openSttStream({
+      onPartial: (event) => {
+        const current = activeUtterances.get(socket.id);
+        if (!current || current.utteranceId !== utteranceId) return;
+        if (typeof event.text !== 'string' || event.text.length < current.fullText.length) return;
+
+        current.fullText = event.text;
+        const pendingText = current.fullText.slice(current.committedLength);
+
+        if (/[.!?]\s*$/.test(pendingText.trim())) {
+          flushPending(false);
+        } else if (pendingText.trim() && !current.flushTimer) {
+          current.flushTimer = setTimeout(() => flushPending(false), 1500);
+        }
+
+        if (event.speech_final) flushPending(true);
+      },
+      onError: (err) => {
+        console.error('STT stream error:', err.message);
+        socket.emit('pipeline-error', { message: 'Live transcription failed' });
+      }
+    });
+  });
+
+  socket.on('speech-chunk', (buffer) => {
+    const state = activeUtterances.get(socket.id);
+    if (!state || !Buffer.isBuffer(buffer)) return;
+    if (state.stt) state.stt.send(buffer);
+    state.sameLanguageListeners.forEach(id => io.to(id).emit('speech-chunk-out', {
+      utteranceId: state.utteranceId, audio: buffer.toString('base64'), sampleRate: 16000
+    }));
+  });
+
+  socket.on('speech-end', () => {
+    const state = activeUtterances.get(socket.id);
+    if (!state) return;
+    if (state.stt) state.stt.finish();
+    state.sameLanguageListeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId: state.utteranceId }));
+
+    // safety net: if the STT stream never reports speech_final for some reason, don't leak the session forever
+    setTimeout(() => {
+      const current = activeUtterances.get(socket.id);
+      if (current && current.utteranceId === state.utteranceId) endUtterance(socket.id);
+    }, 10000);
   });
 
   socket.on('disconnect', () => {
+    endUtterance(socket.id);
     if (!currentRoom || !currentUserId) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
@@ -236,20 +348,143 @@ io.on('connection', (socket) => {
   });
 });
 
-async function transcribe(base64Audio) {
-  const audioBuffer = Buffer.from(base64Audio, 'base64');
-  const form = new FormData();
-  form.append('file', audioBuffer, { filename: 'audio.webm', contentType: 'audio/webm' });
+// closes out an utterance once its final translation/TTS work has actually finished (not just
+// when audio.done arrives) -- called both after flushing the last translation chunk and after
+// each TTS session reports it's done speaking, since both need to have settled.
+function finalizeUtterance(socketId, utteranceId) {
+  const state = activeUtterances.get(socketId);
+  if (!state || state.utteranceId !== utteranceId || state.finalizing) return;
+  state.finalizing = true;
+  if (state.ttsSessions.size === 0) {
+    // same-language-only listeners: nothing was translated, so there's no TTS session to wait on
+    endUtterance(socketId);
+    return;
+  }
+  state.ttsSessions.forEach(session => session.finish());
+}
 
-  const res = await fetch('https://api.x.ai/v1/stt', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${XAI_KEY}`, ...form.getHeaders() },
-    body: form
+function finalizeTranslations(socketId, utteranceId) {
+  const state = activeUtterances.get(socketId);
+  if (!state || state.utteranceId !== utteranceId) return;
+  if (state.pendingTranslations > 0) return; // wait for in-flight translations to land first
+
+  // chat-history text bubbles: sent once text is fully settled, even though audio for
+  // translated listeners may still be streaming in for a moment longer
+  io.to(socketId).emit('my-transcript', { text: state.fullText });
+  state.sameLanguageListeners.forEach(id => io.to(id).emit('speech-transcript', {
+    original: state.fullText, translated: state.fullText
+  }));
+  state.targetLanguages.forEach(lang => {
+    const translated = state.translatedText.get(lang) || state.fullText;
+    (state.listenersByLanguage.get(lang) || []).forEach(id => io.to(id).emit('speech-transcript', {
+      original: state.fullText, translated
+    }));
   });
 
-  if (!res.ok) throw new Error(`xAI STT error: ${await res.text()}`);
-  const data = await res.json();
-  return data.text || null;
+  finalizeUtterance(socketId, utteranceId);
+}
+
+function maybeFinishUtterance(socketId, utteranceId) {
+  const state = activeUtterances.get(socketId);
+  if (!state || state.utteranceId !== utteranceId) return;
+  const allDone = [...state.ttsSessions.values()].every(s => s.isDone());
+  if (state.finalizing && allDone) endUtterance(socketId);
+}
+
+// --- xAI streaming WebSocket helpers ---
+
+// Returns the handle synchronously (not a Promise) so the caller can start feeding it audio
+// immediately -- sends are queued internally until the connection actually reports ready, so no
+// chunk sent right after speech-start is ever lost while the WebSocket handshake is in flight.
+function openSttStream({ onPartial, onError }) {
+  const ws = new WebSocket('wss://api.x.ai/v1/stt?sample_rate=16000&encoding=pcm&interim_results=true', {
+    headers: { Authorization: `Bearer ${XAI_KEY}` }
+  });
+  let ready = false;
+  const queue = [];
+
+  const handle = {
+    send(buf) { if (ready) ws.send(buf); else queue.push(buf); },
+    finish() {
+      const msg = JSON.stringify({ type: 'audio.done' });
+      if (ready) ws.send(msg); else queue.push(msg);
+    },
+    close() { try { ws.close(); } catch (e) { /* already closed */ } }
+  };
+
+  ws.on('message', (data) => {
+    let event;
+    try { event = JSON.parse(data.toString()); } catch (e) { return; }
+
+    if (event.type === 'transcript.created') {
+      ready = true;
+      queue.forEach(item => ws.send(item));
+      queue.length = 0;
+    } else if (event.type === 'transcript.partial') {
+      onPartial(event);
+    } else if (event.type === 'error') {
+      onError(new Error(event.message));
+    }
+  });
+
+  ws.on('error', (err) => onError(err));
+
+  return handle;
+}
+
+// Also returns synchronously (see openSttStream above) -- text sent right after the session is
+// requested queues internally until the WebSocket is actually open.
+function openTtsStream({ language, voiceId, onAudioDelta, onDone, onError }) {
+  const langCode = LANG_CODES[language] || 'en';
+  const params = new URLSearchParams({
+    language: langCode,
+    voice: voiceId || 'ara',
+    codec: 'pcm',
+    sample_rate: '24000'
+  });
+  const ws = new WebSocket(`wss://api.x.ai/v1/tts?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${XAI_KEY}` }
+  });
+  let ready = false;
+  let done = false;
+  const queue = [];
+
+  const handle = {
+    sendText(delta) {
+      const msg = JSON.stringify({ type: 'text.delta', delta });
+      if (ready) ws.send(msg); else queue.push(msg);
+    },
+    finish() {
+      const msg = JSON.stringify({ type: 'text.done' });
+      if (ready) ws.send(msg); else queue.push(msg);
+    },
+    isDone() { return done; },
+    close() { try { ws.close(); } catch (e) { /* already closed */ } }
+  };
+
+  ws.on('open', () => {
+    ready = true;
+    queue.forEach(m => ws.send(m));
+    queue.length = 0;
+  });
+
+  ws.on('message', (data) => {
+    let event;
+    try { event = JSON.parse(data.toString()); } catch (e) { return; }
+
+    if (event.type === 'audio.delta') {
+      onAudioDelta(Buffer.from(event.delta, 'base64'));
+    } else if (event.type === 'audio.done') {
+      done = true;
+      onDone();
+    } else if (event.type === 'error') {
+      onError(new Error(event.message));
+    }
+  });
+
+  ws.on('error', (err) => onError(err));
+
+  return handle;
 }
 
 async function translate(text, fromLang, toLang) {
@@ -257,7 +492,7 @@ async function translate(text, fromLang, toLang) {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${XAI_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'grok-3',
+      model: 'grok-4.20-0309-non-reasoning',
       messages: [{
         role: 'user',
         content: `Translate from ${fromLang} to ${toLang}. Return ONLY the translation with no explanation:\n\n${text}`
@@ -273,20 +508,6 @@ async function translate(text, fromLang, toLang) {
 function pickVoiceId(sourceLanguage, targetLanguage) {
   if (sourceLanguage === 'Turkish' && targetLanguage === 'English') return 'd634b6da3d3b';
   return 'ara';
-}
-
-async function textToSpeech(text, language, voiceId) {
-  const langCode = LANG_CODES[language] || 'en';
-
-  const res = await fetch('https://api.x.ai/v1/tts', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${XAI_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice_id: voiceId || 'ara', language: langCode })
-  });
-
-  if (!res.ok) throw new Error(`xAI TTS error: ${await res.text()}`);
-  const buffer = await res.arrayBuffer();
-  return Buffer.from(buffer);
 }
 
 const LANG_CODES = {

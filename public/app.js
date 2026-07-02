@@ -1,9 +1,17 @@
 const socket = io();
 
 let myLanguage = 'English';
-let mediaRecorder = null;
-let audioChunks = [];
 let isConnected = false;
+
+// live-capture state while the talk button is held
+let micStream = null;
+let micSource = null;
+let micWorkletNode = null;
+let workletLoaded = false;
+
+// per-incoming-utterance scheduling so chunks from the same utterance play back gaplessly
+// while chunks from a different utterance (e.g. someone else talking) don't collide with it
+const playbackCursors = new Map(); // utteranceId -> next scheduled play time
 
 const $ = id => document.getElementById(id);
 
@@ -83,13 +91,30 @@ socket.on('participants-updated', ({ count, languages }) => {
   updateParticipants(count, languages);
 });
 
-socket.on('audio-received', ({ audio, mimeType, original, translated }) => {
-  $('processing-indicator').classList.add('hidden');
-  const bubble = addTranscript('them', original, translated);
-  playAudio(audio, mimeType, bubble);
+// a new incoming utterance is about to start streaming in — reset its playback cursor
+socket.on('speech-utterance-start', ({ utteranceId }) => {
+  playbackCursors.set(utteranceId, 0);
+});
+
+// one small chunk of audio for an utterance that's still being generated/spoken -- scheduled to
+// play immediately back-to-back with the previous chunk of the same utterance, instead of
+// waiting for the whole clip like the old one-shot pipeline did
+socket.on('speech-chunk-out', ({ utteranceId, audio, sampleRate }) => {
+  playPcmChunk(utteranceId, audio, sampleRate);
+});
+
+socket.on('speech-utterance-done', ({ utteranceId }) => {
+  playbackCursors.delete(utteranceId);
+});
+
+// text-only chat-history bubbles, sent once translation has fully settled (audio for it may
+// still be finishing playback a moment later, which is fine -- text and voice arrive separately)
+socket.on('speech-transcript', ({ original, translated }) => {
+  addTranscript('them', original, translated);
 });
 
 socket.on('my-transcript', ({ text }) => {
+  $('processing-indicator').classList.add('hidden');
   addTranscript('me', text);
 });
 
@@ -103,16 +128,14 @@ socket.on('pipeline-error', ({ message }) => {
 $('leave-btn').addEventListener('click', leaveRoom);
 
 function leaveRoom() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-  }
+  stopRecording();
   socket.emit('leave-room');
   forgetRoom();
   socket.disconnect();
   socket.connect();
 
   isConnected = false;
-  audioChunks = [];
+  playbackCursors.clear();
 
   $('transcript-list').innerHTML = '<div class="placeholder">Transcripts will appear here</div>';
   $('processing-indicator').classList.add('hidden');
@@ -198,29 +221,30 @@ talkBtn.addEventListener('mouseup', stopRecording);
 talkBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); });
 talkBtn.addEventListener('touchend', e => { e.preventDefault(); stopRecording(); });
 
+// streams raw 16kHz PCM to the server continuously while the button is held, instead of
+// recording a full clip and uploading it only after release -- this is what lets the server
+// start transcribing (and the other side start hearing a translation) while you're still talking
 async function startRecording() {
-  if (!isConnected) return;
+  if (!isConnected || micWorkletNode) return;
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') await ctx.resume();
 
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    if (!workletLoaded) {
+      await ctx.audioWorklet.addModule('/pcm-worklet.js');
+      workletLoaded = true;
+    }
 
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) audioChunks.push(e.data);
+    micSource = ctx.createMediaStreamSource(micStream);
+    micWorkletNode = new AudioWorkletNode(ctx, 'pcm-capture-processor');
+    micWorkletNode.port.onmessage = (e) => {
+      socket.emit('speech-chunk', e.data); // raw PCM16 ArrayBuffer; socket.io sends it as binary
     };
+    micSource.connect(micWorkletNode);
 
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(audioChunks, { type: 'audio/webm' });
-      if (blob.size < 1000) return; // ignore empty recordings
-      const base64 = await blobToBase64(blob);
-      $('processing-indicator').classList.remove('hidden');
-      socket.emit('audio', { audio: base64 });
-    };
-
-    mediaRecorder.start();
+    socket.emit('speech-start');
     talkBtn.classList.add('recording');
     $('rec-indicator').classList.remove('hidden');
   } catch (err) {
@@ -247,25 +271,25 @@ function microphoneErrorMessage(err) {
 }
 
 function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-    talkBtn.classList.remove('recording');
-    $('rec-indicator').classList.add('hidden');
-  }
+  if (!micWorkletNode) return;
+
+  socket.emit('speech-end');
+  $('processing-indicator').classList.remove('hidden');
+
+  micWorkletNode.port.onmessage = null;
+  micWorkletNode.disconnect();
+  micWorkletNode = null;
+  if (micSource) { micSource.disconnect(); micSource = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+
+  talkBtn.classList.remove('recording');
+  $('rec-indicator').classList.add('hidden');
 }
 
 // --- Helpers ---
 
-function blobToBase64(blob) {
-  return new Promise(resolve => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-    reader.readAsDataURL(blob);
-  });
-}
-
 // one shared AudioContext, unlocked by the first tap anywhere on the page.
-// after that one-time unlock, clips decoded through it can play from async
+// after that one-time unlock, buffers scheduled through it can play from async
 // code (e.g. an incoming socket message) with no further gesture needed —
 // unlike a plain `new Audio()`, which mobile Safari blocks every time unless
 // play() is called directly inside a fresh user gesture.
@@ -287,55 +311,33 @@ function unlockAudioContext() {
   document.addEventListener(evt, unlockAudioContext, { once: true, capture: true });
 });
 
-async function playAudio(base64, mimeType, bubble) {
+// decodes one small raw-PCM16 chunk and schedules it to start exactly when the previous chunk
+// of the SAME utterance ends, so a stream of small chunks arriving over time plays back as one
+// continuous, gapless clip instead of needing to wait for -- or re-decode -- a whole file.
+function playPcmChunk(utteranceId, base64, sampleRate) {
+  const ctx = getAudioContext();
+  if (ctx.state !== 'running') return; // page hasn't been interacted with yet; nothing we can do
+
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const int16 = new Int16Array(bytes.buffer);
+  if (int16.length === 0) return;
 
-  if (await tryPlayWithWebAudio(bytes.buffer)) return;
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
 
-  playAudioElementFallback(bytes, mimeType, bubble);
-}
+  const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+  buffer.copyToChannel(float32, 0);
 
-async function tryPlayWithWebAudio(arrayBuffer) {
-  try {
-    const ctx = getAudioContext();
-    if (ctx.state === 'suspended') await ctx.resume();
-    if (ctx.state !== 'running') return false;
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
 
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
-    source.start(0);
-    return true;
-  } catch (err) {
-    return false;
-  }
-}
-
-function playAudioElementFallback(bytes, mimeType, bubble) {
-  const blob = new Blob([bytes], { type: mimeType || 'audio/mpeg' });
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.onended = () => URL.revokeObjectURL(url);
-
-  audio.play().catch(() => {
-    if (bubble) showPlayFallback(bubble, url);
-  });
-}
-
-function showPlayFallback(bubble, url) {
-  const btn = document.createElement('button');
-  btn.className = 'play-fallback-btn';
-  btn.textContent = '🔊 Tap to play';
-  btn.addEventListener('click', () => {
-    const audio = new Audio(url);
-    audio.onended = () => URL.revokeObjectURL(url);
-    audio.play().catch(() => {});
-    btn.remove();
-  }, { once: true });
-  bubble.appendChild(btn);
+  const scheduledAt = playbackCursors.get(utteranceId) || 0;
+  const startAt = Math.max(ctx.currentTime, scheduledAt);
+  source.start(startAt);
+  playbackCursors.set(utteranceId, startAt + buffer.duration);
 }
 
 function addTranscript(who, original, translated) {
