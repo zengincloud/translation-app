@@ -67,14 +67,7 @@ $('code-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinRo
 function joinRoom() {
   const code = $('code-input').value.trim().toUpperCase();
   if (code.length < 6) return showLobbyError('Enter a 6-character room code');
-  myLanguage = $('my-language').value;
-
-  socket.emit('join-room', { code, language: myLanguage, userId }, (res) => {
-    if (res.error) return showLobbyError(res.error);
-    rememberRoom(code, myLanguage);
-    enterRoom(code);
-    updateParticipants(res.count, res.languages);
-  });
+  showQrJoinView(code);
 }
 
 function showLobbyError(msg) {

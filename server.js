@@ -201,7 +201,7 @@ io.on('connection', (socket) => {
         const translated = await translate(transcript, userLanguage, targetLanguage);
         if (!translated) continue;
 
-        const ttsAudio = await textToSpeech(translated, targetLanguage);
+        const ttsAudio = await textToSpeech(translated, targetLanguage, pickVoiceId(userLanguage, targetLanguage));
         const payload = {
           audio: ttsAudio.toString('base64'),
           mimeType: 'audio/mpeg',
@@ -270,13 +270,18 @@ async function translate(text, fromLang, toLang) {
   return data.choices[0].message.content.trim();
 }
 
-async function textToSpeech(text, language) {
+function pickVoiceId(sourceLanguage, targetLanguage) {
+  if (sourceLanguage === 'Turkish' && targetLanguage === 'English') return 'd634b6da3d3b';
+  return 'ara';
+}
+
+async function textToSpeech(text, language, voiceId) {
   const langCode = LANG_CODES[language] || 'en';
 
   const res = await fetch('https://api.x.ai/v1/tts', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${XAI_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice_id: 'ara', language: langCode })
+    body: JSON.stringify({ text, voice_id: voiceId || 'ara', language: langCode })
   });
 
   if (!res.ok) throw new Error(`xAI TTS error: ${await res.text()}`);
