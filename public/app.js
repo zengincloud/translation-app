@@ -207,10 +207,57 @@ function blobToBase64(blob) {
   });
 }
 
-function playAudio(base64, mimeType, bubble) {
+// one shared AudioContext, unlocked by the first tap anywhere on the page.
+// after that one-time unlock, clips decoded through it can play from async
+// code (e.g. an incoming socket message) with no further gesture needed —
+// unlike a plain `new Audio()`, which mobile Safari blocks every time unless
+// play() is called directly inside a fresh user gesture.
+let audioCtx = null;
+
+function getAudioContext() {
+  if (!audioCtx) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AudioContextClass();
+  }
+  return audioCtx;
+}
+
+function unlockAudioContext() {
+  const ctx = getAudioContext();
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+}
+['touchstart', 'mousedown', 'click'].forEach(evt => {
+  document.addEventListener(evt, unlockAudioContext, { once: true, capture: true });
+});
+
+async function playAudio(base64, mimeType, bubble) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  if (await tryPlayWithWebAudio(bytes.buffer)) return;
+
+  playAudioElementFallback(bytes, mimeType, bubble);
+}
+
+async function tryPlayWithWebAudio(arrayBuffer) {
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') await ctx.resume();
+    if (ctx.state !== 'running') return false;
+
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.start(0);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function playAudioElementFallback(bytes, mimeType, bubble) {
   const blob = new Blob([bytes], { type: mimeType || 'audio/mpeg' });
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
