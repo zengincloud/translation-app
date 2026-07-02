@@ -92,7 +92,7 @@ io.on('connection', (socket) => {
 async function transcribe(base64Audio) {
   const audioBuffer = Buffer.from(base64Audio, 'base64');
   const form = new FormData();
-  form.append('audio', audioBuffer, { filename: 'audio.webm', contentType: 'audio/webm' });
+  form.append('file', audioBuffer, { filename: 'audio.webm', contentType: 'audio/webm' });
 
   const res = await fetch('https://api.x.ai/v1/stt', {
     method: 'POST',
