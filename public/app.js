@@ -65,8 +65,8 @@ socket.on('peer-left', () => {
 
 socket.on('translated-audio', ({ audio, transcript, original }) => {
   $('processing-indicator').classList.add('hidden');
-  addTranscript('them', original, transcript);
-  playAudio(audio);
+  const bubble = addTranscript('them', original, transcript);
+  playAudio(audio, bubble);
 });
 
 socket.on('my-transcript', ({ text, translated }) => {
@@ -160,15 +160,31 @@ function blobToBase64(blob) {
   });
 }
 
-function playAudio(base64) {
+function playAudio(base64, bubble) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const blob = new Blob([bytes], { type: 'audio/mpeg' });
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
-  audio.play().catch(() => {});
   audio.onended = () => URL.revokeObjectURL(url);
+
+  audio.play().catch(() => {
+    if (bubble) showPlayFallback(bubble, url);
+  });
+}
+
+function showPlayFallback(bubble, url) {
+  const btn = document.createElement('button');
+  btn.className = 'play-fallback-btn';
+  btn.textContent = '🔊 Tap to play';
+  btn.addEventListener('click', () => {
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.play().catch(() => {});
+    btn.remove();
+  }, { once: true });
+  bubble.appendChild(btn);
 }
 
 function addTranscript(who, original, translated) {
@@ -184,6 +200,7 @@ function addTranscript(who, original, translated) {
   `;
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
+  return div;
 }
 
 function addSystemMessage(msg) {
