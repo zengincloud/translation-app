@@ -27,17 +27,25 @@ app.get('/api/qrcode', async (req, res) => {
   }
 });
 
-// rooms: code -> { users: [{ id, language }] }
+// rooms: code -> { users: Map<userId, { socketId, language, connected, disconnectedAt }> }
 const rooms = new Map();
 const MAX_ROOM_SIZE = 20;
+const GRACE_MS = 5 * 60 * 1000; // how long a dropped connection can rejoin before losing its slot / the room is torn down
+
+// key `${roomCode}:${userId}` -> timeout that finalizes removal once the grace period lapses
+const cleanupTimers = new Map();
 
 function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+function connectedUsers(room) {
+  return [...room.users.values()].filter(u => u.connected);
+}
+
 function languageBreakdown(room) {
   const counts = new Map();
-  room.users.forEach(u => counts.set(u.language, (counts.get(u.language) || 0) + 1));
+  connectedUsers(room).forEach(u => counts.set(u.language, (counts.get(u.language) || 0) + 1));
   return [...counts.entries()].map(([language, count]) => ({ language, count }));
 }
 
@@ -45,50 +53,130 @@ function broadcastParticipants(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
   io.to(roomCode).emit('participants-updated', {
-    count: room.users.length,
+    count: connectedUsers(room).length,
     languages: languageBreakdown(room)
   });
 }
 
+function cancelCleanup(roomCode, userId) {
+  const key = `${roomCode}:${userId}`;
+  clearTimeout(cleanupTimers.get(key));
+  cleanupTimers.delete(key);
+}
+
+function scheduleCleanup(roomCode, userId) {
+  const key = `${roomCode}:${userId}`;
+  clearTimeout(cleanupTimers.get(key));
+  cleanupTimers.set(key, setTimeout(() => {
+    cleanupTimers.delete(key);
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    const user = room.users.get(userId);
+    if (!user || user.connected) return; // they reconnected in the meantime
+
+    room.users.delete(userId);
+    if (room.users.size === 0) {
+      rooms.delete(roomCode);
+    } else {
+      broadcastParticipants(roomCode);
+    }
+  }, GRACE_MS));
+}
+
+function removeUserImmediately(roomCode, userId) {
+  cancelCleanup(roomCode, userId);
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  room.users.delete(userId);
+  if (room.users.size === 0) {
+    rooms.delete(roomCode);
+  } else {
+    broadcastParticipants(roomCode);
+  }
+}
+
 io.on('connection', (socket) => {
   let currentRoom = null;
+  let currentUserId = null;
   let userLanguage = null;
 
-  socket.on('create-room', ({ language }, callback) => {
+  socket.on('create-room', ({ language, userId }, callback) => {
     const code = generateCode();
-    rooms.set(code, { users: [{ id: socket.id, language }] });
+    rooms.set(code, {
+      users: new Map([[userId, { socketId: socket.id, language, connected: true, disconnectedAt: null }]])
+    });
     socket.join(code);
     currentRoom = code;
+    currentUserId = userId;
     userLanguage = language;
     callback({ code });
   });
 
-  socket.on('join-room', ({ code, language }, callback) => {
+  socket.on('join-room', ({ code, language, userId }, callback) => {
     const roomCode = code.toUpperCase();
     const room = rooms.get(roomCode);
     if (!room) return callback({ error: 'Room not found' });
-    if (room.users.length >= MAX_ROOM_SIZE) return callback({ error: 'Room is full' });
+    if (room.users.size >= MAX_ROOM_SIZE) return callback({ error: 'Room is full' });
 
-    room.users.push({ id: socket.id, language });
+    room.users.set(userId, { socketId: socket.id, language, connected: true, disconnectedAt: null });
     socket.join(roomCode);
     currentRoom = roomCode;
+    currentUserId = userId;
     userLanguage = language;
 
     callback({
       success: true,
       myLanguage: language,
-      count: room.users.length,
+      count: connectedUsers(room).length,
       languages: languageBreakdown(room)
     });
     broadcastParticipants(roomCode);
   });
 
+  // fired when a client that still remembers a room (e.g. its tab was backgrounded and
+  // the socket dropped) reconnects — reclaims its slot instead of registering as new
+  socket.on('rejoin-room', ({ code, userId }, callback) => {
+    const roomCode = (code || '').toUpperCase();
+    const room = rooms.get(roomCode);
+    if (!room) return callback({ error: 'Room not found' });
+    const user = room.users.get(userId);
+    if (!user) return callback({ error: 'Room not found' });
+
+    user.socketId = socket.id;
+    user.connected = true;
+    user.disconnectedAt = null;
+    socket.join(roomCode);
+    currentRoom = roomCode;
+    currentUserId = userId;
+    userLanguage = user.language;
+    cancelCleanup(roomCode, userId);
+
+    callback({
+      success: true,
+      myLanguage: user.language,
+      count: connectedUsers(room).length,
+      languages: languageBreakdown(room)
+    });
+    broadcastParticipants(roomCode);
+  });
+
+  // explicit "Leave" click — remove the slot right away rather than waiting out the grace period
+  socket.on('leave-room', () => {
+    if (!currentRoom || !currentUserId) return;
+    removeUserImmediately(currentRoom, currentUserId);
+    currentRoom = null;
+    currentUserId = null;
+    userLanguage = null;
+  });
+
   socket.on('audio', async ({ audio }) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
-    if (!room || room.users.length < 2) return;
+    if (!room) return;
+    const roomUsers = connectedUsers(room);
+    if (roomUsers.length < 2) return;
 
-    const others = room.users.filter(u => u.id !== socket.id);
+    const others = roomUsers.filter(u => u.socketId !== socket.id);
     if (others.length === 0) return;
 
     try {
@@ -98,7 +186,7 @@ io.on('connection', (socket) => {
       // listeners who already speak the same language just get the raw audio, no translation needed
       const sameLanguage = others.filter(u => u.language === userLanguage);
       sameLanguage.forEach(u => {
-        io.to(u.id).emit('audio-received', {
+        io.to(u.socketId).emit('audio-received', {
           audio,
           mimeType: 'audio/webm',
           original: transcript,
@@ -123,7 +211,7 @@ io.on('connection', (socket) => {
 
         others
           .filter(u => u.language === targetLanguage)
-          .forEach(u => io.to(u.id).emit('audio-received', payload));
+          .forEach(u => io.to(u.socketId).emit('audio-received', payload));
       }
 
       socket.emit('my-transcript', { text: transcript });
@@ -134,15 +222,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    if (!currentRoom) return;
+    if (!currentRoom || !currentUserId) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
-    room.users = room.users.filter(u => u.id !== socket.id);
-    if (room.users.length === 0) {
-      rooms.delete(currentRoom);
-    } else {
-      broadcastParticipants(currentRoom);
-    }
+    const user = room.users.get(currentUserId);
+    // a newer connection (rejoin) may have already claimed this slot — don't clobber it
+    if (!user || user.socketId !== socket.id) return;
+
+    user.connected = false;
+    user.disconnectedAt = Date.now();
+    broadcastParticipants(currentRoom);
+    scheduleCleanup(currentRoom, currentUserId);
   });
 });
 

@@ -7,12 +7,54 @@ let isConnected = false;
 
 const $ = id => document.getElementById(id);
 
+// identifies this browser tab across reconnects (e.g. after being backgrounded on mobile
+// and dropped by the server) so it can silently reclaim its seat in the room
+function getUserId() {
+  let id = sessionStorage.getItem('userId');
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    sessionStorage.setItem('userId', id);
+  }
+  return id;
+}
+const userId = getUserId();
+
+function rememberRoom(code, language) {
+  sessionStorage.setItem('roomCode', code);
+  sessionStorage.setItem('language', language);
+}
+
+function forgetRoom() {
+  sessionStorage.removeItem('roomCode');
+  sessionStorage.removeItem('language');
+}
+
+// fires on the initial connection and on every automatic reconnection (e.g. after a
+// mobile tab is backgrounded and the socket drops) — if we remember being in a room,
+// silently rejoin instead of dumping the user back at the lobby
+socket.on('connect', () => {
+  const savedCode = sessionStorage.getItem('roomCode');
+  const savedLanguage = sessionStorage.getItem('language');
+  if (!savedCode || !savedLanguage) return;
+
+  myLanguage = savedLanguage;
+  socket.emit('rejoin-room', { code: savedCode, userId }, (res) => {
+    if (res.error) {
+      forgetRoom();
+      return;
+    }
+    enterRoom(savedCode);
+    updateParticipants(res.count, res.languages);
+  });
+});
+
 // --- Lobby ---
 
 $('create-btn').addEventListener('click', () => {
   myLanguage = $('my-language').value;
 
-  socket.emit('create-room', { language: myLanguage }, ({ code }) => {
+  socket.emit('create-room', { language: myLanguage, userId }, ({ code }) => {
+    rememberRoom(code, myLanguage);
     enterRoom(code);
     updateParticipants(1, [{ language: myLanguage, count: 1 }]);
     showQrCode(code);
@@ -27,8 +69,9 @@ function joinRoom() {
   if (code.length < 6) return showLobbyError('Enter a 6-character room code');
   myLanguage = $('my-language').value;
 
-  socket.emit('join-room', { code, language: myLanguage }, (res) => {
+  socket.emit('join-room', { code, language: myLanguage, userId }, (res) => {
     if (res.error) return showLobbyError(res.error);
+    rememberRoom(code, myLanguage);
     enterRoom(code);
     updateParticipants(res.count, res.languages);
   });
@@ -70,6 +113,8 @@ function leaveRoom() {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.stop();
   }
+  socket.emit('leave-room');
+  forgetRoom();
   socket.disconnect();
   socket.connect();
 
@@ -125,13 +170,14 @@ function showQrJoinView(code) {
 
 function joinRoomWithLanguage(code, language) {
   myLanguage = language;
-  socket.emit('join-room', { code, language }, (res) => {
+  socket.emit('join-room', { code, language, userId }, (res) => {
     if (res.error) {
       const el = $('qr-join-error');
       el.textContent = res.error;
       el.classList.remove('hidden');
       return;
     }
+    rememberRoom(code, language);
     $('qr-join-view').classList.add('hidden');
     enterRoom(code);
     updateParticipants(res.count, res.languages);
@@ -185,7 +231,25 @@ async function startRecording() {
     talkBtn.classList.add('recording');
     $('rec-indicator').classList.remove('hidden');
   } catch (err) {
-    addSystemMessage('Microphone access denied');
+    addSystemMessage(microphoneErrorMessage(err));
+  }
+}
+
+function microphoneErrorMessage(err) {
+  switch (err.name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+      return 'Microphone access denied. Check your phone\'s app-level permission for this browser (not just the site permission).';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'No microphone found on this device.';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'Microphone is already in use by another app.';
+    case 'SecurityError':
+      return 'Microphone requires a secure (https) connection.';
+    default:
+      return `Microphone error: ${err.message || err.name || 'unknown error'}`;
   }
 }
 
