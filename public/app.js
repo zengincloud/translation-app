@@ -74,6 +74,31 @@ socket.on('pipeline-error', ({ message }) => {
   addSystemMessage(message);
 });
 
+// --- Leave room ---
+
+$('leave-btn').addEventListener('click', leaveRoom);
+
+function leaveRoom() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  }
+  socket.disconnect();
+  socket.connect();
+
+  isConnected = false;
+  peerLanguage = null;
+  audioChunks = [];
+
+  $('transcript-list').innerHTML = '<div class="placeholder">Transcripts will appear here</div>';
+  $('processing-indicator').classList.add('hidden');
+  $('rec-indicator').classList.add('hidden');
+  $('talk-btn').disabled = true;
+  $('code-input').value = '';
+
+  $('room').classList.add('hidden');
+  $('lobby').classList.remove('hidden');
+}
+
 // --- Push to talk ---
 
 const talkBtn = $('talk-btn');

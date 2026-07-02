@@ -166,6 +166,31 @@ select:focus {
   align-items: center;
 }
 
+.room-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.leave-btn {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+  color: #ccc;
+  font-size: 15px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+
+.leave-btn:hover { opacity: 0.8; }
+.leave-btn:active { transform: scale(0.94); }
+
 .room-code-label {
   font-size: 13px;
   color: #555;
