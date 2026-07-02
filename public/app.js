@@ -12,7 +12,11 @@ const $ = id => document.getElementById(id);
 
 $('create-btn').addEventListener('click', () => {
   myLanguage = $('my-language').value;
-  socket.emit('create-room', { language: myLanguage }, ({ code }) => {
+  const chosenPeerLanguage = $('peer-language').value;
+  if (chosenPeerLanguage === myLanguage) return showLobbyError('Choose two different languages');
+
+  socket.emit('create-room', { language: myLanguage, peerLanguage: chosenPeerLanguage }, ({ code }) => {
+    peerLanguage = chosenPeerLanguage;
     enterRoom(code, false);
   });
 });
@@ -23,10 +27,10 @@ $('code-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinRo
 function joinRoom() {
   const code = $('code-input').value.trim().toUpperCase();
   if (code.length < 6) return showLobbyError('Enter a 6-character room code');
-  myLanguage = $('my-language').value;
 
-  socket.emit('join-room', { code, language: myLanguage }, (res) => {
+  socket.emit('join-room', { code }, (res) => {
     if (res.error) return showLobbyError(res.error);
+    myLanguage = res.myLanguage;
     peerLanguage = res.peerLanguage;
     enterRoom(code, true);
   });

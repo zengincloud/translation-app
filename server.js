@@ -13,7 +13,7 @@ const XAI_KEY = process.env.XAI_API_KEY;
 
 app.use(express.static('public'));
 
-// rooms: code -> [{ id, language }]
+// rooms: code -> { users: [{ id, language }], peerLanguage }
 const rooms = new Map();
 
 function generateCode() {
@@ -24,34 +24,36 @@ io.on('connection', (socket) => {
   let currentRoom = null;
   let userLanguage = null;
 
-  socket.on('create-room', ({ language }, callback) => {
+  socket.on('create-room', ({ language, peerLanguage }, callback) => {
     const code = generateCode();
-    rooms.set(code, [{ id: socket.id, language }]);
+    rooms.set(code, { users: [{ id: socket.id, language }], peerLanguage });
     socket.join(code);
     currentRoom = code;
     userLanguage = language;
     callback({ code });
   });
 
-  socket.on('join-room', ({ code, language }, callback) => {
+  socket.on('join-room', ({ code }, callback) => {
     const roomCode = code.toUpperCase();
     const room = rooms.get(roomCode);
     if (!room) return callback({ error: 'Room not found' });
-    if (room.length >= 2) return callback({ error: 'Room is full' });
+    if (room.users.length >= 2) return callback({ error: 'Room is full' });
 
-    room.push({ id: socket.id, language });
+    const language = room.peerLanguage;
+    room.users.push({ id: socket.id, language });
     socket.join(roomCode);
     currentRoom = roomCode;
     userLanguage = language;
 
+    const creator = room.users[0];
     socket.to(roomCode).emit('peer-joined', { language });
-    callback({ success: true, peerLanguage: room[0].language });
+    callback({ success: true, myLanguage: language, peerLanguage: creator.language });
   });
 
   socket.on('audio', async ({ audio, targetLanguage }) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
-    if (!room || room.length < 2) return;
+    if (!room || room.users.length < 2) return;
 
     try {
       const transcript = await transcribe(audio);
@@ -79,11 +81,11 @@ io.on('connection', (socket) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
-    const updated = room.filter(u => u.id !== socket.id);
+    const updated = room.users.filter(u => u.id !== socket.id);
     if (updated.length === 0) {
       rooms.delete(currentRoom);
     } else {
-      rooms.set(currentRoom, updated);
+      room.users = updated;
       io.to(currentRoom).emit('peer-left');
     }
   });
