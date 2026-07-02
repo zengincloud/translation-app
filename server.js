@@ -35,8 +35,15 @@ const GRACE_MS = 5 * 60 * 1000; // how long a dropped connection can rejoin befo
 // key `${roomCode}:${userId}` -> timeout that finalizes removal once the grace period lapses
 const cleanupTimers = new Map();
 
-// per-socket live-utterance state while its talk button is held: socket.id -> utterance state
+// per-socket live-utterance state for whichever single utterance (one STT connection's worth of
+// speech, ending at speech_final) is currently in progress: socket.id -> utterance state
 const activeUtterances = new Map();
+
+// tracks whether a socket's mic is still toggled on, independent of any individual utterance --
+// a conversation is many utterances back-to-back (xAI's STT closes each one out at a natural
+// pause), so when one finishes we check this to decide whether to transparently open the next
+// one, rather than requiring the user to re-tap the button between every sentence
+const micSessions = new Map(); // socket.id -> { active, roomCode, userId, language }
 
 function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -98,7 +105,9 @@ function removeUserImmediately(roomCode, userId) {
   }
 }
 
-// tears down any in-progress live-transcription/speech session for a socket (disconnect, error, or utterance end)
+// tears down whatever utterance is CURRENTLY active for a socket, unconditionally -- for
+// disconnect/leave-room, where the user is actually gone and there's no "next utterance" that
+// might already be listening in its place.
 function endUtterance(socketId) {
   const state = activeUtterances.get(socketId);
   if (!state) return;
@@ -106,6 +115,167 @@ function endUtterance(socketId) {
   clearTimeout(state.flushTimer);
   if (state.stt) state.stt.close();
   state.ttsSessions.forEach(session => session.close());
+}
+
+// closes THIS utterance's own connections and removes it from activeUtterances only if the map
+// still points to this exact utterance. Used when a specific utterance finishes/errors, since by
+// that point the map may have already moved on to the next utterance in the same conversation
+// (see beginUtterance's speech_final handling) -- naively deleting by socket id here would wipe
+// out that newer, still-listening utterance instead of this finished one.
+function finishState(state) {
+  clearTimeout(state.flushTimer);
+  if (state.stt) state.stt.close();
+  state.ttsSessions.forEach(session => session.close());
+  if (activeUtterances.get(state.socketId) === state) {
+    activeUtterances.delete(state.socketId);
+  }
+}
+
+// if the mic is still toggled on when an utterance finishes naturally (as opposed to an
+// explicit mute or a disconnect), seamlessly opens the next one -- otherwise the user would have
+// to re-tap the button between every single sentence of a conversation
+function maybeContinueMicSession(socketId) {
+  const micSession = micSessions.get(socketId);
+  if (!micSession || !micSession.active) return;
+  const socket = io.sockets.sockets.get(socketId);
+  if (!socket) return;
+  beginUtterance(socket, micSession.roomCode, micSession.language);
+}
+
+// Opens one utterance's worth of STT/TTS pipeline: a single continuous stretch of speech from
+// when it starts until xAI's STT reports speech_final (a natural pause). A full conversation is
+// many of these back-to-back while the mic stays toggled on -- see maybeContinueMicSession.
+function beginUtterance(socket, roomCode, language) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  const others = connectedUsers(room).filter(u => u.socketId !== socket.id);
+  if (others.length === 0) return;
+
+  const utteranceId = `${socket.id}-${Date.now()}`;
+  const sameLanguageListeners = others.filter(u => u.language === language).map(u => u.socketId);
+  const targetLanguages = [...new Set(others.map(u => u.language).filter(l => l !== language))];
+
+  sameLanguageListeners.forEach(id => io.to(id).emit('speech-utterance-start', { utteranceId, sampleRate: 16000 }));
+  targetLanguages.forEach(lang => {
+    others.filter(u => u.language === lang)
+      .forEach(u => io.to(u.socketId).emit('speech-utterance-start', { utteranceId, sampleRate: 24000 }));
+  });
+
+  const listenersByLanguage = new Map(
+    targetLanguages.map(lang => [lang, others.filter(u => u.language === lang).map(u => u.socketId)])
+  );
+
+  // NOTE: every function below closes over this `state` object directly rather than re-fetching
+  // it from `activeUtterances` -- that map only tracks which utterance is currently LISTENING
+  // for live audio, and gets swapped to a new one the instant speech_final arrives (see below) so
+  // the next utterance's STT connection is ready with no gap. This utterance's own translation
+  // and TTS keep running to completion independently in the background after that swap, using
+  // this closure, so they can't be short-circuited by a "is this still the current one?" check
+  // that would now say no.
+  const state = {
+    socketId: socket.id,
+    utteranceId,
+    sameLanguageListeners,
+    targetLanguages,
+    listenersByLanguage,
+    ttsSessions: new Map(),   // targetLanguage -> stream handle
+    translatedText: new Map(), // targetLanguage -> accumulated translated text (for the chat history bubble)
+    fullText: '',
+    committedLength: 0,
+    flushTimer: null,
+    stt: null,
+    pendingTranslations: 0,
+    finalizing: false
+  };
+  activeUtterances.set(socket.id, state);
+
+  targetLanguages.forEach(lang => {
+    const listeners = listenersByLanguage.get(lang);
+    const handle = openTtsStream({
+      language: lang,
+      voiceId: pickVoiceId(language, lang),
+      onAudioDelta: (buf) => {
+        listeners.forEach(id => io.to(id).emit('speech-chunk-out', {
+          utteranceId, audio: buf.toString('base64'), sampleRate: 24000
+        }));
+      },
+      onDone: () => {
+        listeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId }));
+        maybeFinishUtterance(state);
+      },
+      onError: (err) => {
+        console.error('TTS stream error:', err.message);
+        listeners.forEach(id => io.to(id).emit('pipeline-error', { message: 'Translation audio failed for this message' }));
+        maybeFinishUtterance(state);
+      }
+    });
+    state.ttsSessions.set(lang, handle);
+  });
+
+  function flushPending(isFinal) {
+    const pendingText = state.fullText.slice(state.committedLength);
+    clearTimeout(state.flushTimer);
+    state.flushTimer = null;
+
+    if (!pendingText.trim()) {
+      if (isFinal) finalizeTranslations(state);
+      return;
+    }
+    state.committedLength = state.fullText.length;
+
+    targetLanguages.forEach(lang => {
+      state.pendingTranslations++;
+      translate(pendingText, language, lang)
+        .then(translated => {
+          if (!translated) return;
+          const soFar = state.translatedText.get(lang) || '';
+          state.translatedText.set(lang, soFar ? `${soFar} ${translated}` : translated);
+          const session = state.ttsSessions.get(lang);
+          if (session) session.sendText(translated);
+        })
+        .catch(err => console.error('Translate error:', err.message))
+        .finally(() => {
+          state.pendingTranslations--;
+          if (isFinal) finalizeTranslations(state);
+        });
+    });
+
+    if (isFinal && targetLanguages.length === 0) finalizeTranslations(state);
+  }
+
+  state.stt = openSttStream({
+    onPartial: (event) => {
+      if (typeof event.text !== 'string' || event.text.length < state.fullText.length) return;
+
+      state.fullText = event.text;
+      const pendingText = state.fullText.slice(state.committedLength);
+
+      if (/[.!?]\s*$/.test(pendingText.trim())) {
+        flushPending(false);
+      } else if (pendingText.trim() && !state.flushTimer) {
+        state.flushTimer = setTimeout(() => flushPending(false), 1500);
+      }
+
+      if (event.speech_final) {
+        // stop listening on this connection and, if still toggled on, start the next utterance's
+        // STT connection right away -- otherwise audio for the next sentence keeps arriving here
+        // and is fed into a stream that already considers itself finished, which is what was
+        // causing sentences to get lost or garbled mid-conversation
+        if (state.stt) state.stt.close();
+        if (activeUtterances.get(socket.id) === state) {
+          maybeContinueMicSession(socket.id);
+        }
+        flushPending(true);
+      }
+    },
+    onError: (err) => {
+      console.error('STT stream error:', err.message);
+      socket.emit('pipeline-error', { message: 'Live transcription failed' });
+      finishState(state);
+      maybeContinueMicSession(socket.id); // try to recover rather than leaving them stuck silent
+    }
+  });
 }
 
 io.on('connection', (socket) => {
@@ -176,6 +346,7 @@ io.on('connection', (socket) => {
   // explicit "Leave" click — remove the slot right away rather than waiting out the grace period
   socket.on('leave-room', () => {
     endUtterance(socket.id);
+    micSessions.delete(socket.id);
     if (!currentRoom || !currentUserId) return;
     removeUserImmediately(currentRoom, currentUserId);
     currentRoom = null;
@@ -184,135 +355,14 @@ io.on('connection', (socket) => {
   });
 
   // --- Live streaming speech pipeline ---
-  // Fired the instant the talk button is pressed, before any audio exists yet. This opens the
+  // Fired the instant the talk button is tapped on, before any audio exists yet. This opens the
   // STT WebSocket and the per-target-language TTS WebSockets immediately so their connection
   // setup happens in parallel with the user taking a breath and starting to talk, instead of
   // adding that setup time to the critical path once audio is ready.
   socket.on('speech-start', () => {
     if (!currentRoom || !currentUserId) return;
-    const room = rooms.get(currentRoom);
-    if (!room) return;
-
-    const others = connectedUsers(room).filter(u => u.socketId !== socket.id);
-    if (others.length === 0) return;
-
-    endUtterance(socket.id); // safety: clear out any stale prior session for this socket
-
-    const utteranceId = `${socket.id}-${Date.now()}`;
-    const sameLanguageListeners = others.filter(u => u.language === userLanguage).map(u => u.socketId);
-    const targetLanguages = [...new Set(others.map(u => u.language).filter(l => l !== userLanguage))];
-
-    sameLanguageListeners.forEach(id => io.to(id).emit('speech-utterance-start', { utteranceId, sampleRate: 16000 }));
-    targetLanguages.forEach(lang => {
-      others.filter(u => u.language === lang)
-        .forEach(u => io.to(u.socketId).emit('speech-utterance-start', { utteranceId, sampleRate: 24000 }));
-    });
-
-    const listenersByLanguage = new Map(
-      targetLanguages.map(lang => [lang, others.filter(u => u.language === lang).map(u => u.socketId)])
-    );
-
-    const state = {
-      utteranceId,
-      sameLanguageListeners,
-      targetLanguages,
-      listenersByLanguage,
-      ttsSessions: new Map(),   // targetLanguage -> stream handle
-      translatedText: new Map(), // targetLanguage -> accumulated translated text (for the chat history bubble)
-      fullText: '',
-      committedLength: 0,
-      flushTimer: null,
-      stt: null,
-      pendingTranslations: 0,
-      finalizing: false
-    };
-    activeUtterances.set(socket.id, state);
-
-    targetLanguages.forEach(lang => {
-      const listeners = listenersByLanguage.get(lang);
-      const handle = openTtsStream({
-        language: lang,
-        voiceId: pickVoiceId(userLanguage, lang),
-        onAudioDelta: (buf) => {
-          listeners.forEach(id => io.to(id).emit('speech-chunk-out', {
-            utteranceId, audio: buf.toString('base64'), sampleRate: 24000
-          }));
-        },
-        onDone: () => {
-          listeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId }));
-          maybeFinishUtterance(socket.id, utteranceId);
-        },
-        onError: (err) => {
-          console.error('TTS stream error:', err.message);
-          listeners.forEach(id => io.to(id).emit('pipeline-error', { message: 'Translation audio failed for this message' }));
-          maybeFinishUtterance(socket.id, utteranceId);
-        }
-      });
-      state.ttsSessions.set(lang, handle);
-    });
-
-    function flushPending(isFinal) {
-      const state = activeUtterances.get(socket.id);
-      if (!state || state.utteranceId !== utteranceId) return;
-
-      const pendingText = state.fullText.slice(state.committedLength);
-      clearTimeout(state.flushTimer);
-      state.flushTimer = null;
-
-      if (!pendingText.trim()) {
-        if (isFinal) finalizeTranslations(socket.id, utteranceId);
-        return;
-      }
-      state.committedLength = state.fullText.length;
-
-      targetLanguages.forEach(lang => {
-        state.pendingTranslations++;
-        translate(pendingText, userLanguage, lang)
-          .then(translated => {
-            if (!translated) return;
-            const current = activeUtterances.get(socket.id);
-            if (!current || current.utteranceId !== utteranceId) return;
-            const soFar = current.translatedText.get(lang) || '';
-            current.translatedText.set(lang, soFar ? `${soFar} ${translated}` : translated);
-            const session = current.ttsSessions.get(lang);
-            if (session) session.sendText(translated);
-          })
-          .catch(err => console.error('Translate error:', err.message))
-          .finally(() => {
-            const current = activeUtterances.get(socket.id);
-            if (current && current.utteranceId === utteranceId) {
-              current.pendingTranslations--;
-              if (isFinal) finalizeTranslations(socket.id, utteranceId);
-            }
-          });
-      });
-
-      if (isFinal && targetLanguages.length === 0) finalizeTranslations(socket.id, utteranceId);
-    }
-
-    state.stt = openSttStream({
-      onPartial: (event) => {
-        const current = activeUtterances.get(socket.id);
-        if (!current || current.utteranceId !== utteranceId) return;
-        if (typeof event.text !== 'string' || event.text.length < current.fullText.length) return;
-
-        current.fullText = event.text;
-        const pendingText = current.fullText.slice(current.committedLength);
-
-        if (/[.!?]\s*$/.test(pendingText.trim())) {
-          flushPending(false);
-        } else if (pendingText.trim() && !current.flushTimer) {
-          current.flushTimer = setTimeout(() => flushPending(false), 1500);
-        }
-
-        if (event.speech_final) flushPending(true);
-      },
-      onError: (err) => {
-        console.error('STT stream error:', err.message);
-        socket.emit('pipeline-error', { message: 'Live transcription failed' });
-        endUtterance(socket.id); // no more transcript can come from a broken STT stream
-      }
-    });
+    micSessions.set(socket.id, { active: true, roomCode: currentRoom, userId: currentUserId, language: userLanguage });
+    beginUtterance(socket, currentRoom, userLanguage);
   });
 
   socket.on('speech-chunk', (buffer) => {
@@ -324,21 +374,24 @@ io.on('connection', (socket) => {
     }));
   });
 
+  // explicit mute (tapped off) -- unlike a natural pause mid-conversation, this one should NOT
+  // trigger the next utterance to auto-start
   socket.on('speech-end', () => {
+    const micSession = micSessions.get(socket.id);
+    if (micSession) micSession.active = false;
+
     const state = activeUtterances.get(socket.id);
     if (!state) return;
     if (state.stt) state.stt.finish();
     state.sameLanguageListeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId: state.utteranceId }));
 
     // safety net: if the STT stream never reports speech_final for some reason, don't leak the session forever
-    setTimeout(() => {
-      const current = activeUtterances.get(socket.id);
-      if (current && current.utteranceId === state.utteranceId) endUtterance(socket.id);
-    }, 10000);
+    setTimeout(() => finishState(state), 10000);
   });
 
   socket.on('disconnect', () => {
     endUtterance(socket.id);
+    micSessions.delete(socket.id);
     if (!currentRoom || !currentUserId) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
@@ -355,27 +408,26 @@ io.on('connection', (socket) => {
 
 // closes out an utterance once its final translation/TTS work has actually finished (not just
 // when audio.done arrives) -- called both after flushing the last translation chunk and after
-// each TTS session reports it's done speaking, since both need to have settled.
-function finalizeUtterance(socketId, utteranceId) {
-  const state = activeUtterances.get(socketId);
-  if (!state || state.utteranceId !== utteranceId || state.finalizing) return;
+// each TTS session reports it's done speaking, since both need to have settled. Operates on the
+// state object directly (see beginUtterance) since by now activeUtterances may already point to
+// a newer utterance in the same conversation.
+function finalizeUtterance(state) {
+  if (state.finalizing) return;
   state.finalizing = true;
   if (state.ttsSessions.size === 0) {
     // same-language-only listeners: nothing was translated, so there's no TTS session to wait on
-    endUtterance(socketId);
+    finishState(state);
     return;
   }
   state.ttsSessions.forEach(session => session.finish());
 }
 
-function finalizeTranslations(socketId, utteranceId) {
-  const state = activeUtterances.get(socketId);
-  if (!state || state.utteranceId !== utteranceId) return;
+function finalizeTranslations(state) {
   if (state.pendingTranslations > 0) return; // wait for in-flight translations to land first
 
   // chat-history text bubbles: sent once text is fully settled, even though audio for
   // translated listeners may still be streaming in for a moment longer
-  io.to(socketId).emit('my-transcript', { text: state.fullText });
+  io.to(state.socketId).emit('my-transcript', { text: state.fullText });
   state.sameLanguageListeners.forEach(id => io.to(id).emit('speech-transcript', {
     original: state.fullText, translated: state.fullText
   }));
@@ -386,14 +438,14 @@ function finalizeTranslations(socketId, utteranceId) {
     }));
   });
 
-  finalizeUtterance(socketId, utteranceId);
+  finalizeUtterance(state);
 }
 
-function maybeFinishUtterance(socketId, utteranceId) {
-  const state = activeUtterances.get(socketId);
-  if (!state || state.utteranceId !== utteranceId) return;
+function maybeFinishUtterance(state) {
   const allDone = [...state.ttsSessions.values()].every(s => s.isDone());
-  if (state.finalizing && allDone) endUtterance(socketId);
+  if (state.finalizing && allDone) {
+    finishState(state);
+  }
 }
 
 // --- xAI streaming WebSocket helpers ---
@@ -408,11 +460,19 @@ function openSttStream({ onPartial, onError }) {
   let ready = false;
   const queue = [];
 
+  // guards against sending on a socket that has since closed or errored -- this can legitimately
+  // happen now, since an utterance's STT connection gets closed proactively at speech_final while
+  // a caller might still (harmlessly) try to use the handle for a moment afterward
+  function safeSend(payload) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(payload); } catch (e) { /* socket closed between the check and the send */ }
+  }
+
   const handle = {
-    send(buf) { if (ready) ws.send(buf); else queue.push(buf); },
+    send(buf) { if (ready) safeSend(buf); else queue.push(buf); },
     finish() {
       const msg = JSON.stringify({ type: 'audio.done' });
-      if (ready) ws.send(msg); else queue.push(msg);
+      if (ready) safeSend(msg); else queue.push(msg);
     },
     close() { try { ws.close(); } catch (e) { /* already closed */ } }
   };
@@ -454,14 +514,19 @@ function openTtsStream({ language, voiceId, onAudioDelta, onDone, onError }) {
   let done = false;
   const queue = [];
 
+  function safeSend(payload) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(payload); } catch (e) { /* socket closed between the check and the send */ }
+  }
+
   const handle = {
     sendText(delta) {
       const msg = JSON.stringify({ type: 'text.delta', delta });
-      if (ready) ws.send(msg); else queue.push(msg);
+      if (ready) safeSend(msg); else queue.push(msg);
     },
     finish() {
       const msg = JSON.stringify({ type: 'text.done' });
-      if (ready) ws.send(msg); else queue.push(msg);
+      if (ready) safeSend(msg); else queue.push(msg);
     },
     isDone() { return done; },
     close() { try { ws.close(); } catch (e) { /* already closed */ } }
