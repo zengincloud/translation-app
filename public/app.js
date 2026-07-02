@@ -100,13 +100,54 @@ function hideQrCode() {
   $('qr-code').src = '';
 }
 
-// pre-fill the room code if the page was opened via a scanned QR link (?code=XXXXXX)
-// language still needs to be picked manually, so this doesn't auto-join
-(function prefillCodeFromLink() {
+// --- QR join (opened via a scanned room QR link, ?code=XXXXXX) ---
+
+function getLanguageOptions() {
+  return [...document.querySelectorAll('#my-language option')].map(o => o.value);
+}
+
+function showQrJoinView(code) {
+  $('qr-join-code').textContent = code;
+
+  const grid = $('qr-join-languages');
+  grid.innerHTML = '';
+  getLanguageOptions().forEach(lang => {
+    const btn = document.createElement('button');
+    btn.className = 'lang-choice-btn';
+    btn.textContent = lang;
+    btn.addEventListener('click', () => joinRoomWithLanguage(code, lang));
+    grid.appendChild(btn);
+  });
+
+  $('lobby').classList.add('hidden');
+  $('qr-join-view').classList.remove('hidden');
+}
+
+function joinRoomWithLanguage(code, language) {
+  myLanguage = language;
+  socket.emit('join-room', { code, language }, (res) => {
+    if (res.error) {
+      const el = $('qr-join-error');
+      el.textContent = res.error;
+      el.classList.remove('hidden');
+      return;
+    }
+    $('qr-join-view').classList.add('hidden');
+    enterRoom(code);
+    updateParticipants(res.count, res.languages);
+  });
+}
+
+$('qr-join-back').addEventListener('click', () => {
+  $('qr-join-view').classList.add('hidden');
+  $('lobby').classList.remove('hidden');
+});
+
+(function handleIncomingQrLink() {
   const code = new URLSearchParams(window.location.search).get('code');
-  if (!code) return;
-  $('code-input').value = code.toUpperCase();
   history.replaceState({}, '', window.location.pathname);
+  if (!code) return;
+  showQrJoinView(code.toUpperCase());
 })();
 
 // --- Push to talk ---
@@ -239,7 +280,6 @@ function updateParticipants(count, languages) {
 
   if (isConnected) {
     setStatus('connected', 'Connected');
-    hideQrCode();
   } else {
     setStatus('waiting', 'Waiting for someone to join…');
   }

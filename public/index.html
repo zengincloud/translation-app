@@ -42,6 +42,23 @@
       <div id="lobby-error" class="error hidden"></div>
     </div>
 
+    <!-- QR join (shown instead of the lobby when opened via a scanned room QR code) -->
+    <div id="qr-join-view" class="hidden">
+      <div class="logo">LiveTranslate</div>
+
+      <div class="qr-join-heading">Joining room <span id="qr-join-code"></span></div>
+
+      <div class="field">
+        <label>Choose your language to speak in</label>
+      </div>
+
+      <div id="qr-join-languages" class="lang-choice-grid"></div>
+
+      <div id="qr-join-error" class="error hidden"></div>
+
+      <button id="qr-join-back" class="btn secondary">Go to lobby instead</button>
+    </div>
+
     <!-- Room -->
     <div id="room" class="hidden">
       <div class="room-header">
@@ -64,12 +81,6 @@
         <div class="qr-hint">Scan to join on their phone</div>
       </div>
 
-      <div id="transcripts">
-        <div id="transcript-list">
-          <div class="placeholder">Transcripts will appear here</div>
-        </div>
-      </div>
-
       <div class="talk-area">
         <button id="talk-btn" class="talk-btn" disabled>
           <span class="mic">🎤</span>
@@ -77,6 +88,12 @@
         </button>
         <div id="rec-indicator" class="rec hidden">● Recording</div>
         <div id="processing-indicator" class="processing hidden">Translating…</div>
+      </div>
+
+      <div id="transcripts">
+        <div id="transcript-list">
+          <div class="placeholder">Transcripts will appear here</div>
+        </div>
       </div>
     </div>
 
