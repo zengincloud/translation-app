@@ -26,22 +26,7 @@
           <option value="Portuguese">Portuguese</option>
           <option value="Hindi">Hindi</option>
           <option value="Russian">Russian</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label>Their language</label>
-        <select id="peer-language">
-          <option value="English">English</option>
-          <option value="Arabic">Arabic</option>
-          <option value="Spanish" selected>Spanish</option>
-          <option value="French">French</option>
-          <option value="German">German</option>
-          <option value="Chinese">Chinese</option>
-          <option value="Japanese">Japanese</option>
-          <option value="Portuguese">Portuguese</option>
-          <option value="Hindi">Hindi</option>
-          <option value="Russian">Russian</option>
+          <option value="Turkish">Turkish</option>
         </select>
       </div>
 
@@ -67,13 +52,12 @@
         <div id="status" class="status waiting">Waiting for someone to join…</div>
       </div>
 
-      <div id="participant-count" class="participant-count">1 of 2 in room</div>
-
       <div class="lang-bar">
         <div class="lang-pill" id="my-lang-pill"></div>
-        <div class="lang-arrow">⇄</div>
-        <div class="lang-pill muted" id="peer-lang-pill">?</div>
       </div>
+
+      <div id="participant-count" class="participant-count">Just you so far</div>
+      <div id="language-breakdown" class="language-breakdown"></div>
 
       <div id="qr-wrap" class="qr-wrap hidden">
         <img id="qr-code" alt="Scan to join room">

@@ -1,7 +1,6 @@
 const socket = io();
 
 let myLanguage = 'English';
-let peerLanguage = null;
 let mediaRecorder = null;
 let audioChunks = [];
 let isConnected = false;
@@ -12,12 +11,10 @@ const $ = id => document.getElementById(id);
 
 $('create-btn').addEventListener('click', () => {
   myLanguage = $('my-language').value;
-  const chosenPeerLanguage = $('peer-language').value;
-  if (chosenPeerLanguage === myLanguage) return showLobbyError('Choose two different languages');
 
-  socket.emit('create-room', { language: myLanguage, peerLanguage: chosenPeerLanguage }, ({ code }) => {
-    peerLanguage = chosenPeerLanguage;
-    enterRoom(code, false);
+  socket.emit('create-room', { language: myLanguage }, ({ code }) => {
+    enterRoom(code);
+    updateParticipants(1, [{ language: myLanguage, count: 1 }]);
     showQrCode(code);
   });
 });
@@ -28,12 +25,12 @@ $('code-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinRo
 function joinRoom() {
   const code = $('code-input').value.trim().toUpperCase();
   if (code.length < 6) return showLobbyError('Enter a 6-character room code');
+  myLanguage = $('my-language').value;
 
-  socket.emit('join-room', { code }, (res) => {
+  socket.emit('join-room', { code, language: myLanguage }, (res) => {
     if (res.error) return showLobbyError(res.error);
-    myLanguage = res.myLanguage;
-    peerLanguage = res.peerLanguage;
-    enterRoom(code, true);
+    enterRoom(code);
+    updateParticipants(res.count, res.languages);
   });
 }
 
@@ -46,35 +43,18 @@ function showLobbyError(msg) {
 
 // --- Room ---
 
-socket.on('peer-joined', ({ language }) => {
-  peerLanguage = language;
-  $('peer-lang-pill').textContent = language;
-  $('peer-lang-pill').classList.remove('muted');
-  setStatus('connected', 'Connected');
-  $('talk-btn').disabled = false;
-  isConnected = true;
-  hideQrCode();
-  updateParticipantCount(2);
+socket.on('participants-updated', ({ count, languages }) => {
+  updateParticipants(count, languages);
 });
 
-socket.on('peer-left', () => {
-  isConnected = false;
-  peerLanguage = null;
-  $('peer-lang-pill').textContent = '?';
-  $('peer-lang-pill').classList.add('muted');
-  setStatus('waiting', 'Peer disconnected');
-  $('talk-btn').disabled = true;
-  updateParticipantCount(1);
-});
-
-socket.on('translated-audio', ({ audio, transcript, original }) => {
+socket.on('audio-received', ({ audio, mimeType, original, translated }) => {
   $('processing-indicator').classList.add('hidden');
-  const bubble = addTranscript('them', original, transcript);
-  playAudio(audio, bubble);
+  const bubble = addTranscript('them', original, translated);
+  playAudio(audio, mimeType, bubble);
 });
 
-socket.on('my-transcript', ({ text, translated }) => {
-  addTranscript('me', text, translated);
+socket.on('my-transcript', ({ text }) => {
+  addTranscript('me', text);
 });
 
 socket.on('pipeline-error', ({ message }) => {
@@ -94,7 +74,6 @@ function leaveRoom() {
   socket.connect();
 
   isConnected = false;
-  peerLanguage = null;
   audioChunks = [];
 
   $('transcript-list').innerHTML = '<div class="placeholder">Transcripts will appear here</div>';
@@ -121,12 +100,12 @@ function hideQrCode() {
   $('qr-code').src = '';
 }
 
-// auto-join if the page was opened via a scanned QR link (?code=XXXXXX)
-(function joinFromLinkIfPresent() {
+// pre-fill the room code if the page was opened via a scanned QR link (?code=XXXXXX)
+// language still needs to be picked manually, so this doesn't auto-join
+(function prefillCodeFromLink() {
   const code = new URLSearchParams(window.location.search).get('code');
   if (!code) return;
   $('code-input').value = code.toUpperCase();
-  joinRoom();
   history.replaceState({}, '', window.location.pathname);
 })();
 
@@ -140,7 +119,7 @@ talkBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecording
 talkBtn.addEventListener('touchend', e => { e.preventDefault(); stopRecording(); });
 
 async function startRecording() {
-  if (!isConnected || !peerLanguage) return;
+  if (!isConnected) return;
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -158,7 +137,7 @@ async function startRecording() {
       if (blob.size < 1000) return; // ignore empty recordings
       const base64 = await blobToBase64(blob);
       $('processing-indicator').classList.remove('hidden');
-      socket.emit('audio', { audio: base64, targetLanguage: peerLanguage });
+      socket.emit('audio', { audio: base64 });
     };
 
     mediaRecorder.start();
@@ -187,11 +166,11 @@ function blobToBase64(blob) {
   });
 }
 
-function playAudio(base64, bubble) {
+function playAudio(base64, mimeType, bubble) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const blob = new Blob([bytes], { type: 'audio/mpeg' });
+  const blob = new Blob([bytes], { type: mimeType || 'audio/mpeg' });
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   audio.onended = () => URL.revokeObjectURL(url);
@@ -221,10 +200,15 @@ function addTranscript(who, original, translated) {
 
   const div = document.createElement('div');
   div.className = `bubble ${who}`;
-  div.innerHTML = `
-    <div class="bubble-original">${escapeHtml(original)}</div>
-    <div class="bubble-translated">${escapeHtml(translated)}</div>
-  `;
+
+  const showTranslated = translated && translated !== original;
+  div.innerHTML = showTranslated
+    ? `
+      <div class="bubble-original">${escapeHtml(original)}</div>
+      <div class="bubble-translated">${escapeHtml(translated)}</div>
+    `
+    : `<div class="bubble-translated">${escapeHtml(original)}</div>`;
+
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
   return div;
@@ -249,22 +233,30 @@ function setStatus(type, text) {
   el.textContent = text;
 }
 
-function updateParticipantCount(count) {
-  $('participant-count').textContent = `${count} of 2 in room`;
+function updateParticipants(count, languages) {
+  isConnected = count >= 2;
+  $('talk-btn').disabled = !isConnected;
+
+  if (isConnected) {
+    setStatus('connected', 'Connected');
+    hideQrCode();
+  } else {
+    setStatus('waiting', 'Waiting for someone to join…');
+  }
+
+  $('participant-count').textContent = count === 1
+    ? 'Just you so far'
+    : `${count} in room`;
+
+  const breakdown = $('language-breakdown');
+  breakdown.innerHTML = (languages || [])
+    .map(({ language, count }) => `<span class="lang-chip">${escapeHtml(language)} × ${count}</span>`)
+    .join('');
 }
 
-function enterRoom(code, alreadyConnected) {
+function enterRoom(code) {
   $('lobby').classList.add('hidden');
   $('room').classList.remove('hidden');
   $('room-code-display').textContent = code;
   $('my-lang-pill').textContent = myLanguage;
-  updateParticipantCount(alreadyConnected ? 2 : 1);
-
-  if (alreadyConnected && peerLanguage) {
-    $('peer-lang-pill').textContent = peerLanguage;
-    $('peer-lang-pill').classList.remove('muted');
-    setStatus('connected', 'Connected');
-    $('talk-btn').disabled = false;
-    isConnected = true;
-  }
 }

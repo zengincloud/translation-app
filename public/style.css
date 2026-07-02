@@ -225,6 +225,22 @@ select:focus {
   color: #666;
 }
 
+.language-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+
+.language-breakdown .lang-chip {
+  background: #18181b;
+  border: 1px solid #27272a;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 11px;
+  color: #999;
+}
+
 .lang-bar {
   display: flex;
   align-items: center;

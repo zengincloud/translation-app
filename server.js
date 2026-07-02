@@ -27,64 +27,106 @@ app.get('/api/qrcode', async (req, res) => {
   }
 });
 
-// rooms: code -> { users: [{ id, language }], peerLanguage }
+// rooms: code -> { users: [{ id, language }] }
 const rooms = new Map();
+const MAX_ROOM_SIZE = 20;
 
 function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function languageBreakdown(room) {
+  const counts = new Map();
+  room.users.forEach(u => counts.set(u.language, (counts.get(u.language) || 0) + 1));
+  return [...counts.entries()].map(([language, count]) => ({ language, count }));
+}
+
+function broadcastParticipants(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  io.to(roomCode).emit('participants-updated', {
+    count: room.users.length,
+    languages: languageBreakdown(room)
+  });
 }
 
 io.on('connection', (socket) => {
   let currentRoom = null;
   let userLanguage = null;
 
-  socket.on('create-room', ({ language, peerLanguage }, callback) => {
+  socket.on('create-room', ({ language }, callback) => {
     const code = generateCode();
-    rooms.set(code, { users: [{ id: socket.id, language }], peerLanguage });
+    rooms.set(code, { users: [{ id: socket.id, language }] });
     socket.join(code);
     currentRoom = code;
     userLanguage = language;
     callback({ code });
   });
 
-  socket.on('join-room', ({ code }, callback) => {
+  socket.on('join-room', ({ code, language }, callback) => {
     const roomCode = code.toUpperCase();
     const room = rooms.get(roomCode);
     if (!room) return callback({ error: 'Room not found' });
-    if (room.users.length >= 2) return callback({ error: 'Room is full' });
+    if (room.users.length >= MAX_ROOM_SIZE) return callback({ error: 'Room is full' });
 
-    const language = room.peerLanguage;
     room.users.push({ id: socket.id, language });
     socket.join(roomCode);
     currentRoom = roomCode;
     userLanguage = language;
 
-    const creator = room.users[0];
-    socket.to(roomCode).emit('peer-joined', { language });
-    callback({ success: true, myLanguage: language, peerLanguage: creator.language });
+    callback({
+      success: true,
+      myLanguage: language,
+      count: room.users.length,
+      languages: languageBreakdown(room)
+    });
+    broadcastParticipants(roomCode);
   });
 
-  socket.on('audio', async ({ audio, targetLanguage }) => {
+  socket.on('audio', async ({ audio }) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
     if (!room || room.users.length < 2) return;
+
+    const others = room.users.filter(u => u.id !== socket.id);
+    if (others.length === 0) return;
 
     try {
       const transcript = await transcribe(audio);
       if (!transcript) return;
 
-      const translated = await translate(transcript, userLanguage, targetLanguage);
-      if (!translated) return;
-
-      const ttsAudio = await textToSpeech(translated, targetLanguage);
-
-      socket.to(currentRoom).emit('translated-audio', {
-        audio: ttsAudio.toString('base64'),
-        transcript: translated,
-        original: transcript
+      // listeners who already speak the same language just get the raw audio, no translation needed
+      const sameLanguage = others.filter(u => u.language === userLanguage);
+      sameLanguage.forEach(u => {
+        io.to(u.id).emit('audio-received', {
+          audio,
+          mimeType: 'audio/webm',
+          original: transcript,
+          translated: transcript
+        });
       });
 
-      socket.emit('my-transcript', { text: transcript, translated });
+      // translate + speak once per unique target language, then fan out to everyone listening in that language
+      const targetLanguages = [...new Set(others.map(u => u.language).filter(l => l !== userLanguage))];
+
+      for (const targetLanguage of targetLanguages) {
+        const translated = await translate(transcript, userLanguage, targetLanguage);
+        if (!translated) continue;
+
+        const ttsAudio = await textToSpeech(translated, targetLanguage);
+        const payload = {
+          audio: ttsAudio.toString('base64'),
+          mimeType: 'audio/mpeg',
+          original: transcript,
+          translated
+        };
+
+        others
+          .filter(u => u.language === targetLanguage)
+          .forEach(u => io.to(u.id).emit('audio-received', payload));
+      }
+
+      socket.emit('my-transcript', { text: transcript });
     } catch (err) {
       console.error('Pipeline error:', err.message);
       socket.emit('pipeline-error', { message: 'Translation failed, please try again' });
@@ -95,12 +137,11 @@ io.on('connection', (socket) => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
-    const updated = room.users.filter(u => u.id !== socket.id);
-    if (updated.length === 0) {
+    room.users = room.users.filter(u => u.id !== socket.id);
+    if (room.users.length === 0) {
       rooms.delete(currentRoom);
     } else {
-      room.users = updated;
-      io.to(currentRoom).emit('peer-left');
+      broadcastParticipants(currentRoom);
     }
   });
 });
@@ -156,7 +197,7 @@ async function textToSpeech(text, language) {
 const LANG_CODES = {
   'English': 'en', 'Arabic': 'ar', 'Spanish': 'es', 'French': 'fr',
   'German': 'de', 'Chinese': 'zh', 'Japanese': 'ja', 'Portuguese': 'pt',
-  'Hindi': 'hi', 'Russian': 'ru'
+  'Hindi': 'hi', 'Russian': 'ru', 'Turkish': 'tr'
 };
 
 const PORT = process.env.PORT || 3000;
