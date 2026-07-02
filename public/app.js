@@ -129,6 +129,7 @@ $('leave-btn').addEventListener('click', leaveRoom);
 
 function leaveRoom() {
   stopRecording();
+  releaseMicStream();
   socket.emit('leave-room');
   forgetRoom();
   socket.disconnect();
@@ -212,23 +213,51 @@ $('qr-join-back').addEventListener('click', () => {
   showQrJoinView(code.toUpperCase());
 })();
 
-// --- Push to talk ---
+// --- Tap to speak (toggle) ---
+// One tap starts streaming your mic continuously; tap again to mute yourself. Listening for
+// (and translating) everyone else keeps working the whole time regardless of this state --
+// it's driven entirely by incoming socket events, which don't depend on whether you're talking.
 
 const talkBtn = $('talk-btn');
 
-talkBtn.addEventListener('mousedown', startRecording);
-talkBtn.addEventListener('mouseup', stopRecording);
-talkBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); });
-talkBtn.addEventListener('touchend', e => { e.preventDefault(); stopRecording(); });
+talkBtn.addEventListener('click', () => {
+  if (micWorkletNode) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+});
 
-// streams raw 16kHz PCM to the server continuously while the button is held, instead of
-// recording a full clip and uploading it only after release -- this is what lets the server
-// start transcribing (and the other side start hearing a translation) while you're still talking
+// acquires the mic stream once and keeps it open for as long as we're in the room -- see the
+// note in enterRoom() for why this needs to happen well before (and stay alive well after) any
+// individual talk-button press.
+let micStreamPromise = null;
+function ensureMicStream() {
+  if (!micStreamPromise) {
+    micStreamPromise = navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } })
+      .then(stream => { micStream = stream; return stream; })
+      .catch(err => { micStreamPromise = null; throw err; });
+  }
+  return micStreamPromise;
+}
+
+function releaseMicStream() {
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+  micStreamPromise = null;
+}
+
+// streams raw 16kHz PCM to the server continuously from the moment you tap on until you tap
+// off again, instead of recording a full clip and uploading it only after you stop -- this is
+// what lets the server start transcribing (and the other side start hearing a translation)
+// while you're still talking
 async function startRecording() {
   if (!isConnected || micWorkletNode) return;
 
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+    await ensureMicStream();
     const ctx = getAudioContext();
     if (ctx.state === 'suspended') await ctx.resume();
 
@@ -246,6 +275,7 @@ async function startRecording() {
 
     socket.emit('speech-start');
     talkBtn.classList.add('recording');
+    talkBtn.querySelector('.label').textContent = 'Tap to Mute';
     $('rec-indicator').classList.remove('hidden');
   } catch (err) {
     addSystemMessage(microphoneErrorMessage(err));
@@ -280,9 +310,12 @@ function stopRecording() {
   micWorkletNode.disconnect();
   micWorkletNode = null;
   if (micSource) { micSource.disconnect(); micSource = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  // deliberately NOT stopping micStream's tracks here -- it stays open for the rest of the
+  // room session (see ensureMicStream/enterRoom); only releaseMicStream() (on leaving the room)
+  // actually tears it down.
 
   talkBtn.classList.remove('recording');
+  talkBtn.querySelector('.label').textContent = 'Tap to Speak';
   $('rec-indicator').classList.add('hidden');
 }
 
@@ -405,4 +438,10 @@ function enterRoom(code) {
   $('room').classList.remove('hidden');
   $('room-code-display').textContent = code;
   $('my-lang-pill').textContent = myLanguage;
+
+  // acquire the mic as soon as we're in a room (not just on first talk press) and keep it open
+  // continuously -- on iOS especially, having no active input stream can put the browser's
+  // audio session in a mode where incoming translated audio doesn't play reliably, so a pure
+  // listener (or anyone between their own turns) needs this just as much as a speaker does
+  ensureMicStream().catch(err => addSystemMessage(microphoneErrorMessage(err)));
 }

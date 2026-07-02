@@ -242,7 +242,11 @@ io.on('connection', (socket) => {
           listeners.forEach(id => io.to(id).emit('speech-utterance-done', { utteranceId }));
           maybeFinishUtterance(socket.id, utteranceId);
         },
-        onError: (err) => console.error('TTS stream error:', err.message)
+        onError: (err) => {
+          console.error('TTS stream error:', err.message);
+          listeners.forEach(id => io.to(id).emit('pipeline-error', { message: 'Translation audio failed for this message' }));
+          maybeFinishUtterance(socket.id, utteranceId);
+        }
       });
       state.ttsSessions.set(lang, handle);
     });
@@ -306,6 +310,7 @@ io.on('connection', (socket) => {
       onError: (err) => {
         console.error('STT stream error:', err.message);
         socket.emit('pipeline-error', { message: 'Live transcription failed' });
+        endUtterance(socket.id); // no more transcript can come from a broken STT stream
       }
     });
   });
@@ -478,11 +483,15 @@ function openTtsStream({ language, voiceId, onAudioDelta, onDone, onError }) {
       done = true;
       onDone();
     } else if (event.type === 'error') {
+      done = true; // xAI reported a failure for this session -- it won't produce audio.done either
       onError(new Error(event.message));
     }
   });
 
-  ws.on('error', (err) => onError(err));
+  ws.on('error', (err) => {
+    done = true; // this session will never call onDone -- don't make the utterance wait forever for it
+    onError(err);
+  });
 
   return handle;
 }
