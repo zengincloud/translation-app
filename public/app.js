@@ -18,6 +18,7 @@ $('create-btn').addEventListener('click', () => {
   socket.emit('create-room', { language: myLanguage, peerLanguage: chosenPeerLanguage }, ({ code }) => {
     peerLanguage = chosenPeerLanguage;
     enterRoom(code, false);
+    showQrCode(code);
   });
 });
 
@@ -52,6 +53,8 @@ socket.on('peer-joined', ({ language }) => {
   setStatus('connected', 'Connected');
   $('talk-btn').disabled = false;
   isConnected = true;
+  hideQrCode();
+  updateParticipantCount(2);
 });
 
 socket.on('peer-left', () => {
@@ -61,6 +64,7 @@ socket.on('peer-left', () => {
   $('peer-lang-pill').classList.add('muted');
   setStatus('waiting', 'Peer disconnected');
   $('talk-btn').disabled = true;
+  updateParticipantCount(1);
 });
 
 socket.on('translated-audio', ({ audio, transcript, original }) => {
@@ -98,10 +102,33 @@ function leaveRoom() {
   $('rec-indicator').classList.add('hidden');
   $('talk-btn').disabled = true;
   $('code-input').value = '';
+  hideQrCode();
 
   $('room').classList.add('hidden');
   $('lobby').classList.remove('hidden');
 }
+
+// --- QR join code ---
+
+function showQrCode(code) {
+  const joinUrl = `${window.location.origin}/?code=${code}`;
+  $('qr-code').src = `/api/qrcode?text=${encodeURIComponent(joinUrl)}`;
+  $('qr-wrap').classList.remove('hidden');
+}
+
+function hideQrCode() {
+  $('qr-wrap').classList.add('hidden');
+  $('qr-code').src = '';
+}
+
+// auto-join if the page was opened via a scanned QR link (?code=XXXXXX)
+(function joinFromLinkIfPresent() {
+  const code = new URLSearchParams(window.location.search).get('code');
+  if (!code) return;
+  $('code-input').value = code.toUpperCase();
+  joinRoom();
+  history.replaceState({}, '', window.location.pathname);
+})();
 
 // --- Push to talk ---
 
@@ -222,11 +249,16 @@ function setStatus(type, text) {
   el.textContent = text;
 }
 
+function updateParticipantCount(count) {
+  $('participant-count').textContent = `${count} of 2 in room`;
+}
+
 function enterRoom(code, alreadyConnected) {
   $('lobby').classList.add('hidden');
   $('room').classList.remove('hidden');
   $('room-code-display').textContent = code;
   $('my-lang-pill').textContent = myLanguage;
+  updateParticipantCount(alreadyConnected ? 2 : 1);
 
   if (alreadyConnected && peerLanguage) {
     $('peer-lang-pill').textContent = peerLanguage;

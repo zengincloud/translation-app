@@ -4,6 +4,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const FormData = require('form-data');
 const fetch = require('node-fetch');
+const QRCode = require('qrcode');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +13,19 @@ const io = new Server(server);
 const XAI_KEY = process.env.XAI_API_KEY;
 
 app.use(express.static('public'));
+
+app.get('/api/qrcode', async (req, res) => {
+  const text = req.query.text;
+  if (!text) return res.status(400).send('Missing text param');
+
+  try {
+    const png = await QRCode.toBuffer(text, { width: 240, margin: 1 });
+    res.set('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    res.status(500).send('QR generation failed');
+  }
+});
 
 // rooms: code -> { users: [{ id, language }], peerLanguage }
 const rooms = new Map();
