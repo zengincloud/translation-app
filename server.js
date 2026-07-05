@@ -199,6 +199,8 @@ function beginUtterance(socket, roomCode, language) {
     // flush and just waits for a signal that never comes), leaving the utterance stuck forever
     // with no transcript ever sent and its TTS session never released.
     wantsFinalize: false,
+    speechFinalHandled: false,
+    translationsEmitted: false,
     // hard backstop: if this utterance's TTS session(s) never signal done or error (e.g. a
     // WebSocket that just hangs instead of closing cleanly), force it closed rather than leaking
     // an open connection for the rest of the server's life -- across a long, many-sentence
@@ -266,6 +268,10 @@ function beginUtterance(socket, roomCode, language) {
 
   state.stt = openSttStream({
     onPartial: (event) => {
+      // once speech_final has been handled, this connection is being closed -- ignore anything
+      // else it sends (a redundant re-send, or a message that was already in flight when we
+      // called close()) instead of treating it as new/more speech
+      if (state.speechFinalHandled) return;
       if (typeof event.text !== 'string' || event.text.length < state.fullText.length) return;
 
       state.fullText = event.text;
@@ -277,7 +283,11 @@ function beginUtterance(socket, roomCode, language) {
         state.flushTimer = setTimeout(() => flushPending(false), 1500);
       }
 
-      if (event.speech_final) {
+      if (event.speech_final && !state.speechFinalHandled) {
+        // guard against xAI re-sending speech_final for this same connection (or a message
+        // already in flight arriving just after we call close() below) triggering this whole
+        // block a second time, which would re-translate and re-emit the same sentence
+        state.speechFinalHandled = true;
         // stop listening on this connection and, if still toggled on, start the next utterance's
         // STT connection right away -- otherwise audio for the next sentence keeps arriving here
         // and is fed into a stream that already considers itself finished, which is what was
@@ -444,6 +454,11 @@ function finalizeUtterance(state) {
 
 function finalizeTranslations(state) {
   if (state.pendingTranslations > 0) return; // wait for in-flight translations to land first
+  // belt-and-suspenders: whatever triggers this (multiple in-flight translations completing
+  // around the same time, a redundant event, etc.), the transcript/audio must only ever go out
+  // to listeners once per utterance
+  if (state.translationsEmitted) return;
+  state.translationsEmitted = true;
 
   // chat-history text bubbles: sent once text is fully settled, even though audio for
   // translated listeners may still be streaming in for a moment longer
