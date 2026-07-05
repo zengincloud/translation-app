@@ -113,6 +113,7 @@ function endUtterance(socketId) {
   if (!state) return;
   activeUtterances.delete(socketId);
   clearTimeout(state.flushTimer);
+  clearTimeout(state.safetyTimer);
   if (state.stt) state.stt.close();
   state.ttsSessions.forEach(session => session.close());
 }
@@ -124,6 +125,7 @@ function endUtterance(socketId) {
 // out that newer, still-listening utterance instead of this finished one.
 function finishState(state) {
   clearTimeout(state.flushTimer);
+  clearTimeout(state.safetyTimer);
   if (state.stt) state.stt.close();
   state.ttsSessions.forEach(session => session.close());
   if (activeUtterances.get(state.socketId) === state) {
@@ -186,8 +188,25 @@ function beginUtterance(socket, roomCode, language) {
     flushTimer: null,
     stt: null,
     pendingTranslations: 0,
-    finalizing: false
+    finalizing: false,
+    // set once ANY flush has been marked final (speech_final seen) -- checked by every in-flight
+    // translate() call's own completion handler instead of each call's own captured isFinal flag,
+    // since a translation kicked off by an earlier non-final flush can easily still be pending
+    // when speech_final arrives moments later. Using this instead of the closure-captured value
+    // means whichever translation happens to finish last is always the one that notices the
+    // utterance is actually done and triggers finalization -- otherwise it can fall through the
+    // cracks entirely (the earlier call thinks it isn't final, the later one finds nothing new to
+    // flush and just waits for a signal that never comes), leaving the utterance stuck forever
+    // with no transcript ever sent and its TTS session never released.
+    wantsFinalize: false,
+    // hard backstop: if this utterance's TTS session(s) never signal done or error (e.g. a
+    // WebSocket that just hangs instead of closing cleanly), force it closed rather than leaking
+    // an open connection for the rest of the server's life -- across a long, many-sentence
+    // conversation, leaked sessions like that add up and can exhaust xAI's per-team concurrent
+    // session cap, which is the likely cause of "works for a while, then just stops"
+    safetyTimer: null
   };
+  state.safetyTimer = setTimeout(() => finishState(state), 30000);
   activeUtterances.set(socket.id, state);
 
   targetLanguages.forEach(lang => {
@@ -217,6 +236,7 @@ function beginUtterance(socket, roomCode, language) {
     const pendingText = state.fullText.slice(state.committedLength);
     clearTimeout(state.flushTimer);
     state.flushTimer = null;
+    if (isFinal) state.wantsFinalize = true;
 
     if (!pendingText.trim()) {
       if (isFinal) finalizeTranslations(state);
@@ -237,7 +257,7 @@ function beginUtterance(socket, roomCode, language) {
         .catch(err => console.error('Translate error:', err.message))
         .finally(() => {
           state.pendingTranslations--;
-          if (isFinal) finalizeTranslations(state);
+          if (state.wantsFinalize) finalizeTranslations(state);
         });
     });
 
